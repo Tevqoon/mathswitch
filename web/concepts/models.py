@@ -158,13 +158,17 @@ class Item(models.Model):
         }
 
     def get_linked_items(self):
-        linked_destinations = Link.objects.filter(source=self.id).map(
-            lambda link: link.destination
+        linked_destinations = Item.objects.filter(
+            id__in=Link.objects.filter(source=self).values_list(
+                "destination_id", flat=True
+            )
         )
-        linked_sources = Link.objects.filter(destination=self.id).map(
-            lambda link: link.source
+        linked_sources = Item.objects.filter(
+            id__in=Link.objects.filter(destination=self).values_list(
+                "source_id", flat=True
+            )
         )
-        return set(linked_sources + linked_destinations)
+        return set(linked_destinations | linked_sources)
 
     def get_linked_item_urls(self):
         return [i.get_url() for i in self.get_linked_items()]
