@@ -1,0 +1,532 @@
+#+TITLE: MathSwitch — Project Report
+#+AUTHOR: Project Analysis
+#+DATE: 2026-03-07
+
+* Overview
+
+MathSwitch is a Django web application that aggregates mathematical concepts from multiple reference sources (Wikidata, Wikipedia, nLab, MathWorld, ProofWiki, Encyclopedia of Mathematics, and Agda Unimath) and groups them into unified *Concepts* that a user can navigate across. The core idea is a "relay": given a concept name you can jump to the same concept in any of the indexed sources. An optional LLM-based categorizer can prune non-mathematical items from the index.
+
+* Repository Layout
+
+#+begin_src
+mathswitch/
+├── README.md                   # installation, usage, deployment notes
+├── Makefile                    # comprehensive build/test/pipeline targets
+├── PROJECT_REPORT.org          # this file
+├── pyproject.toml              # black / isort configuration
+├── requirements.txt            # dev tools + re-exports web/requirements.txt
+├── docker-compose.yml          # Docker deployment configuration
+├── Dockerfile                  # container image definition
+├── entrypoint.sh               # container entrypoint script
+├── .python-version             # pinned Python version
+├── .flake8                     # linter config
+├── .gitignore                  # ignores web/snapshots/, fixtures/, etc.
+├── experiments/                # throwaway scripts (not part of the app)
+│   ├── wikidataapi.py
+│   └── test1.py
+├── fixtures/                   # (gitignored) fixture files for testing
+└── web/                        # Django project root
+    ├── manage.py
+    ├── requirements.txt        # runtime dependencies
+    ├── .env.example
+    ├── snapshots/              # (gitignored) SQLite snapshots
+    ├── web/                    # Django project package
+    │   ├── settings.py
+    │   ├── urls.py
+    │   ├── wsgi.py / asgi.py
+    │   └── management/commands/
+    │       ├── rebuild_db.py       # full pipeline orchestrator
+    │       ├── dump_fixtures.py    # export sample fixtures
+    │       ├── load_fixtures.py    # import fixtures
+    │       ├── pipeline_status.py  # show DB statistics
+    │       ├── db_snapshot.py      # save SQLite snapshot
+    │       └── db_restore.py       # restore SQLite snapshot
+    ├── concepts/               # domain models, views, templates
+    ├── slurper/                # data ingestion (see §6)
+    └── categorizer/            # LLM-based item filter
+#+end_src
+
+* Tech Stack & Dependencies
+
+| Layer                    | Technology                                                              |
+|--------------------------+-------------------------------------------------------------------------|
+| Web framework            | Django 4.2 (SQLite by default)                                          |
+| HTTP client              | requests 2.32                                                           |
+| NLP / keyword extraction | spaCy 3.7 + scispaCy 0.6 (=en_core_sci_lg=)                            |
+| LLM categorizer          | langchain-huggingface, transformers, torch, accelerate                  |
+| Config management        | python-decouple                                                         |
+| Code style               | black, isort, flake8                                                    |
+| Containerization         | Docker + Docker Compose                                                 |
+
+Optional paid LLM providers (openai, anthropic) can be added to ~web/requirements.txt~ if required by the categorizer.
+
+* Django Application Architecture
+
+The project package is ~web/web/~. Three installed apps do all the work: ~concepts~ owns the data model and the public website; ~slurper~ contains all data-ingestion logic; ~categorizer~ provides an optional LLM-based quality filter. Settings are read from ~web/.env~ via python-decouple; the only required secret is ~WIKIPEDIA_CONTACT_EMAIL~ (optional — disables Wikipedia fetching when absent).
+
+** URL routing
+
+From ~web/web/urls.py~:
+
+| URL                            | View                                       |
+|--------------------------------+--------------------------------------------|
+| =/=                              | ~concepts.views.home~                        |
+|                                | homepage with search and per-source counts |
+| =/concept/<name>/=               | ~concepts.views.concept~                     |
+|                                | concept detail page                        |
+| =/concept/<source>/<identifier>= | ~concepts.views.redirect_item_to_concept~    |
+|                                | permalink by source item                   |
+| =/search/=                       | ~concepts.views.search~                      |
+|                                | redirects to =/concept/<q>=                  |
+| =/results/<query>=               | ~concepts.views.results~                     |
+|                                | substring-match concept list               |
+| =/admin/=                        | Django admin                               |
+
+* Data Model
+
+Four models live in ~concepts/models.py~.
+
+** Concept
+
+The canonical entry shown to users. Grouped from one or more ~Item~ instances.
+
+| Field       | Type           | Notes                              |
+|-------------+----------------+------------------------------------|
+| ~name~        | CharField(200) | case-insensitive unique constraint |
+| ~description~ | TextField      | nullable                           |
+
+** Item
+
+A single entry from one source. Many ~Item~ rows map to the same ~Concept~.
+
+| Field        | Type           | Notes                                              |
+|--------------+----------------+----------------------------------------------------|
+| ~source~       | TextChoices    | see ~Item.Source~ below                              |
+| ~identifier~   | CharField(200) | source-local key (e.g. =Q12345=, article slug)       |
+| ~url~          | URLField(500)  | direct link to the source page                     |
+| ~name~         | CharField(200) | nullable                                           |
+| ~description~  | TextField      | nullable                                           |
+| ~keywords~     | TextField      | comma-separated scispaCy entities; nullable        |
+| ~article_text~ | TextField      | full Wikipedia extract; nullable                   |
+| ~aliases~      | TextField      | comma-separated alt labels from Wikidata; nullable |
+| ~concept~      | FK -> Concept  | set by ~compute_concepts~; SET_NULL on delete        |
+
+~unique_together = ["source", "identifier"]~ prevents duplicates.
+
+Note: ~url~ was increased from ~max_length=200~ to ~max_length=500~ because agda-unimath URLs can exceed 200 characters (longest observed: 202 chars). A migration is needed: ~python manage.py makemigrations && python manage.py migrate~.
+
+*** Item.Source enum
+
+Ordered by display priority:
+
+| Code  | Display name                |
+|-------+-----------------------------|
+| ~Wd~    | Wikidata                    |
+| ~WpEN~  | Wikipedia (English)         |
+| ~nL~    | nLab                        |
+| ~MW~    | MathWorld                   |
+| ~PW~    | ProofWiki                   |
+| ~EoM~ | Encyclopedia of Mathematics |
+| ~AUm~   | Agda Unimath                |
+
+** Link
+
+A directed edge between two ~Item~ rows indicating they refer to the same concept.
+
+| Field         | Type         | Notes                                        |
+|---------------+--------------+----------------------------------------------|
+| ~source~      | FK -> Item   | outgoing side                                |
+| ~destination~ | FK -> Item   | incoming side                                |
+| ~label~       | TextChoices  | ~Wd~ (from Wikidata property), ~AUm~, ~eq~ (same name) |
+
+~unique_together = ["source", "destination", "label"]~. The static helper ~Link.save_new()~ wraps ~create()~ and silently swallows ~IntegrityError~ for duplicate links.
+
+** CategorizerResult
+
+Records one LLM classification for an ~Item~: a boolean answer and a 0-100 confidence score. Results feed back into the Wikidata slurper -- items classified "no" with >49 % confidence are added to ~EXCLUDED_CATEGORIES~ and filtered out of future SPARQL queries.
+
+* Pipeline Stages
+
+The full data pipeline runs in this order:
+
+#+begin_src
+1. import_wikidata      [NETWORK, SLOW -- minutes to hours]
+   SPARQL queries to Wikidata + Wikipedia article fetches
+
+2. import_agda_unimath  [NETWORK, fast -- seconds]
+   Fetches concept_index.json from agda-unimath site
+
+3. link_same            [LOCAL, fast]
+   Creates Link(label=NAME_EQ) between Items sharing the same name
+
+4. compute_concepts     [LOCAL, fast]
+   Uses UnionFind over Links to group Items into Concept rows
+
+5. categorize           [COMPUTE-heavy, optional]
+   LLM-based classification of items
+#+end_src
+
+** How deduplication and concept-merging works
+
+*** Link creation phase
+
+Three link types exist:
+
+- ~Link.Label.WIKIDATA~ ("Wd") -- created by Wikidata importer connecting Wikidata items to their Wikipedia/nLab/MathWorld/ProofWiki/EoM counterparts via Wikidata external-ID properties
+- ~Link.Label.AGDA_UNIMATH~ ("AUm") -- created by Agda importer when a ~concept_index.json~ entry has a ~"wikidata"~ field, linking the Agda Item to the corresponding Wikidata Item
+- ~Link.Label.NAME_EQ~ ("eq") -- created by ~link_same~, connecting any two Items with the same name (case-insensitive)
+
+*** Concept grouping phase (~compute_concepts~)
+
+1. Items with NO links (no ~incoming_items~, no ~outgoing_items~) each get their own singleton Concept via ~create_singleton_concepts()~
+2. Items WITH links are fed into ~UnionFind(items, Link.objects.all().to_tuples())~ which computes connected components. Each component becomes one Concept.
+3. Within a component, the first non-null name/description is chosen (items sorted by source priority: Wikidata > Wikipedia > nLab > MathWorld > ProofWiki > EoM > Agda)
+4. Concept has a case-insensitive unique constraint on name (~UniqueConstraint(Lower("name"))~)
+
+* Slurpers
+
+The ~slurper~ app ingests data from external sources and populates ~Item~ and ~Link~ rows. All logic lives under ~web/slurper/~.
+
+** End-to-end data flow
+
+#+begin_src
+External sources
+    |
+    |  SPARQL (Wikidata endpoint)       HTTP GET (concept_index.json)
+    v                                   v
+WikidataSlurper.fetch_json()     AgdaUnimathSlurper.fetch_json()
+    |                                   |
+    |  raw SPARQL bindings (list[dict]) |  list[dict] from JSON
+    v                                   |
+BaseWdRawItem.raw_item(source, binding) |
+    |  (factory -> subclass)            |
+    v                                   v
+<Subclass>.to_item()             AgdaUnimathSlurper.json_to_item()
+    |  -> Item (unsaved)                |  -> Item (unsaved)
+    |  -> optional Wikipedia article    |  -> description, keywords, aliases
+    |    fetch + scispaCy NER           |    extracted from entry metadata
+    |    -> Item.keywords               |
+    v                                   v
+item.save()  -------------------- item.save()
+    |                                   |
+    v                                   v
+<Subclass>.save_links()          _create_wikidata_link()
+    |  -> Link.save_new(src, dst)       |  -> Link.save_new(src, dst)
+    v                                   v
+management command: link_same
+    |  -> Link(label=NAME_EQ) for same-name items
+    v
+management command: compute_concepts
+    |  -> UnionFind over Items + Links
+    v
+Concept rows, Item.concept FK set
+#+end_src
+
+** source_wikidata.py -- WikidataSlurper
+
+*** SPARQL construction
+
+~WikidataSlurper.__init__~ assembles a full SPARQL ~SELECT~ query from three parts:
+
+1. A caller-supplied triple pattern (e.g. ~?item wdt:P31 ?topic . ?topic wdt:P2579 wd:Q395 .~).
+2. ~OPTIONAL~ triples for every entry in ~WD_OTHER_SOURCES~ (nLab, MathWorld, ProofWiki, EoM identifiers).
+3. A shared ~SPARQL_QUERY_OPTIONS~ block that adds optional image and Wikipedia link, fetches aliases, excludes humans (~wd:Q5~), excludes ~EXCLUDED_CATEGORIES~, and invokes ~wikibase:label~ for English labels and descriptions.
+
+*** Excluded categories
+
+Built at import time from two sources:
+
+- ~KNOWN_EXCLUDED_CATEGORIES~ -- a hardcoded list (natural numbers, positive integers, countries, philosophical concepts).
+- ~RESULT_EXCLUDED_CATEGORIES~ -- loaded from ~CategorizerResult~ rows where ~result_answer=False~ and average confidence > 49 %, so the categorizer's judgements feed back into future harvests.
+
+*** Wikipedia article fetching
+
+When a SPARQL binding contains a ~wp_en~ key (English Wikipedia URL), ~get_items()~ calls ~fetch_article()~ to retrieve the plaintext article extract via the Wikipedia API (~action=query&prop=extracts&explaintext~). The fetch includes:
+
+- A ~User-Agent~ header identifying the project (requires ~WIKIPEDIA_CONTACT_EMAIL~ in settings; disabled with a one-time warning if absent).
+- Rate-limit sleep of 10 ms between requests.
+- Up to 3 retries with exponential backoff on 429/403 or network errors.
+
+The retrieved text is injected into the binding dict as ~json_item["article_text"]["value"]~ so ~to_item()~ can access it.
+
+*** SLURPERS list
+
+Seven ~WikidataSlurper~ instances are created when the module loads:
+
+- Three for Wikidata items identified by different SPARQL patterns (instance-of topics studied by mathematics; studied-by area of maths; concept-of area of maths).
+- One per ~WD_OTHER_SOURCES~ entry (nLab, MathWorld, ProofWiki, EoM), each selecting items that have the respective Wikidata external-ID property.
+
+** wd_raw_item.py -- raw item class hierarchy
+
+*** WD_OTHER_SOURCES
+
+The central registry mapping each external source to its Wikidata property and SPARQL variable name:
+
+| Source                      | Wikidata property | JSON key |
+|-----------------------------+-------------------+----------|
+| nLab                        | ~wdt:P4215~       | ~nlabID~ |
+| MathWorld                   | ~wdt:P2812~       | ~mwID~   |
+| ProofWiki                   | ~wdt:P6781~       | ~pwID~   |
+| Encyclopedia of Mathematics | ~wdt:P7554~       | ~eomID~  |
+
+*** BaseWdRawItem
+
+The abstract base. On construction it stores the raw SPARQL binding dict and calls ~get_item()~ to cache the corresponding database row (if it already exists). Key methods:
+
+- ~to_item() -> Item~ -- constructs an unsaved ~Item~. If ~article_text()~ is present it calls ~extract_keywords(article)~ from ~keyword_util~, lowercases each entity, and stores them as a comma-separated ~keywords~ string.
+- ~has_source(source)~ -- checks whether the binding contains the key for a given source (special-cases ~WIKIPEDIA_EN~ to look for ~wp_en~).
+- ~switch_source_to(source)~ -- factory delegation: returns a new raw-item subclass wrapping the same binding but for the requested source.
+- ~save_link_to(source)~ -- resolves both sides from the DB and calls ~Link.save_new(self.item, destination, Link.Label.WIKIDATA)~.
+- ~save_links()~ -- base saves the Wikipedia link if present; subclasses extend.
+- ~raw_item(source, json_item)~ -- static factory that dispatches to the correct subclass based on ~source~.
+
+*** Subclass hierarchy
+
+#+begin_src
+BaseWdRawItem
++-- WdRawItem            source=WIKIDATA
+|     identifier()  -> last path segment of the WD entity URI (e.g. Q12345)
+|     url()         -> full WD entity URI
+|     name()        -> itemLabel
+|     description() -> itemDescription
+|     save_links()  -> super() + links to all WD_OTHER_SOURCES present in binding
+|
++-- WpENRawItem          source=WIKIPEDIA_EN
+|     identifier()  -> last path segment of the Wikipedia URL (article slug)
+|     url()         -> wp_en value
+|     name()        -> identifier()
+|
++-- OtherWdRawItem       (abstract base for external sources)
+      identifier()  -> value of the source's json_key in the binding
+      name()        -> identifier()
+      save_links()  -> super() + link back to Wikidata item
+      |
+      +-- nLabRawItem      url -> https://ncatlab.org/nlab/show/<id>
+      +-- MWRawItem        url -> https://mathworld.wolfram.com/<id>.html
+      +-- PWRawItem        url -> https://proofwiki.org/wiki/<id>
+      +-- EoMRawItem       url -> https://encyclopediaofmath.org/wiki/<id>
+#+end_src
+
+For non-Wikidata slurpers ~get_items()~ also yields a ~WdRawItem~ for the corresponding Wikidata entity if it is not already in the database, so both sides of the link exist before ~save_links()~ runs.
+
+** source_agda_unimath.py -- AgdaUnimathSlurper
+
+Fetches ~https://unimath.github.io/agda-unimath/concept_index.json~, an array produced by the agda-unimath mdbook preprocessor (~scripts/preprocessor_concepts.py~). The preprocessor processes ~{{#concept "name" Agda=... WDID=... WD=...}}~ macros in ~.lagda.md~ source files.
+
+*** concept_index.json structure and statistics
+
+| Key          | Required | Description                                                    |
+|--------------+----------+----------------------------------------------------------------|
+| ~id~         | yes      | path-like anchor: ~module.html#concept-name~ (max 163 chars)   |
+| ~name~       | yes      | human-readable concept name with disambiguation (max 93 chars) |
+| ~link~       | yes      | relative URL into the agda-unimath site                        |
+| ~text~       | yes      | short label (typically 1-3 words)                              |
+| ~definition~ | no       | link to formal Agda definition (~page.html#line~)              |
+| ~wikidata~   | no       | Wikidata Q-id (e.g. =Q12345=)                                  |
+
+Statistics from the current index:
+
+| Metric                               | Count |
+|--------------------------------------+-------|
+| Total entries                        |  1862 |
+| Entries with ~wikidata~ field        |   393 |
+| Entries with ~definition~ field      |  1722 |
+| Entries with duplicate names         |    46 |
+| Percentage with Wikidata link        |   21% |
+| Percentage with formal definition    | 92.5% |
+
+*** Integration with MathSwitch
+
+The agda-unimath ~book.toml~ contains a MathSwitch template:
+
+#+begin_src toml
+[preprocessor.concepts]
+mathswitch-template = "https://mathswitch.xyz/concept/Wd/{wikidata_id}"
+#+end_src
+
+This means the agda-unimath site already generates links back to MathSwitch for concepts with Wikidata IDs. The link format uses MathSwitch's ~/concept/<source>/<identifier>~ permalink pattern.
+
+*** Improved importer (current implementation)
+
+The importer now:
+
+1. Defers HTTP fetch to explicit ~fetch_json()~ call (no module-level instantiation)
+2. Populates ~Item.description~ with contextual information (formalization name, module area, definition presence, Wikidata ID)
+3. Populates ~Item.keywords~ with module area, module name, short label, and standard tags (~agda-unimath~, ~formalized mathematics~)
+4. Populates ~Item.aliases~ with the short ~text~ label when it differs from the full ~name~
+5. Reports detailed import statistics (created, skipped, links created/missing/duplicate)
+
+** keyword_util.py -- scispaCy keyword extraction
+
+#+begin_src python
+def extract_keywords(text) -> list[Span]:
+    nlp = _get_nlp()          # lazy-loads spacy.load("en_core_sci_lg")
+    doc = nlp(text)
+    return doc.ents           # named entity spans
+#+end_src
+
+The model is lazy-loaded on first call and cached in ~_nlp~ to avoid reloading across items. The caller (~BaseWdRawItem.to_item~) lowercases each span's text and joins them with ~, ~ into ~Item.keywords~. Requires running ~make install-scispacy~ to download the ~en_core_sci_lg~ model before the first import run.
+
+** Management commands (slurper)
+
+All commands live under ~web/slurper/management/commands/~.
+
+| Command               | Action                                                                                                    |
+|-----------------------+-----------------------------------------------------------------------------------------------------------|
+| ~import_wikidata~     | Iterates ~SLURPERS~, calls ~save_items()~ then ~save_links()~ on each, with inline progress output.      |
+| ~clear_wikidata~      | Deletes all ~Item~ rows for ~WIKIDATA~, ~WIKIPEDIA_EN~, and every source in ~WD_OTHER_SOURCES~.          |
+| ~import_agda_unimath~ | Creates ~AgdaUnimathSlurper~, fetches JSON, reports stats.                                               |
+| ~clear_agda_unimath~  | Deletes all ~Item~ rows with ~source=AGDA_UNIMATH~.                                                      |
+
+* Concepts App
+
+~concepts/~ contains the domain models (see above), four views, and four templates (~base.html~, ~index.html~, ~detail.html~, ~results.html~). The homepage lists all concept names (used as a datalist for autocomplete) and shows per-source item counts. The detail page renders a concept's name, description, and a list of source links. ~redirect_item_to_concept~ provides stable permalinks of the form ~/concept/<source>/<identifier>~ that forward to the canonical concept page. Static assets are a single CSS file and light/dark Wikidata logo variants.
+
+** UnionFind (concepts/utils.py)
+
+The ~UnionFind~ class implements union-find with path compression and union by rank for grouping items into concepts. It takes a list of items and a list of link pairs, resolves each link to element indices, and computes connected components.
+
+Key implementation details:
+- Path compression in ~_find_representative()~ for efficient lookups
+- Union by rank in ~_union()~ to keep trees balanced
+- ~_resolve_link()~ validates each link pair and skips invalid ones (wrong arity, unknown items) with logging
+- ~get_item_components(sort_key)~ returns lists of items grouped by connected component, sorted by a caller-supplied key (used with ~Item.Source.key()~ to prioritize Wikidata names)
+
+* Categorizer App
+
+The ~categorizer~ app sends ~Item~ rows to a local LLM with a yes/no prompt asking whether the item is a genuine mathematical concept. Results are stored as ~CategorizerResult~ rows (boolean answer + integer confidence). These feed back into the Wikidata slurper: items answered "no" with >49 % average confidence become additional entries in ~EXCLUDED_CATEGORIES~, so future harvests skip them. Supported backends include local HuggingFace models (default) and optionally paid APIs (OpenAI, Anthropic). Run via ~make categorize~ / ~python manage.py categorize~. See ~web/categorizer/README.md~ for configuration details.
+
+* Testing & Debugging Toolkit
+
+A comprehensive testing toolkit has been created to enable testing individual pipeline stages without re-fetching data (the major bottleneck).
+
+** Management commands (testing)
+
+All commands live under ~web/web/management/commands/~.
+
+| Command            | Action                                                              |
+|--------------------+---------------------------------------------------------------------|
+| ~dump_fixtures~    | Samples N items per source from live DB, writes JSON fixture        |
+| ~load_fixtures~    | Clears DB and loads fixture (with ~--no-clear~ option)              |
+| ~pipeline_status~  | Shows counts of Items (per source), Links (per label), Concepts     |
+| ~db_snapshot~      | Saves SQLite file snapshot by name                                  |
+| ~db_restore~       | Restores SQLite file snapshot by name                               |
+
+** Makefile targets
+
+The Makefile provides comprehensive targets for every operation:
+
+*** Pipeline stages
+- ~make import-wikidata~ / ~make import-agda~ / ~make link-same~ / ~make compute-concepts~ / ~make categorize~
+
+*** Testing workflow
+- ~make test-dump~ -- export fixture from live DB
+- ~make test-load~ -- load fixture into clean DB
+- ~make test-pipeline~ -- run link_same + compute_concepts on loaded fixture
+- ~make test-relink~ -- clear links/concepts, re-run link_same + compute_concepts
+- ~make test-categorize~ -- run categorizer on test data
+
+*** Snapshot management
+- ~make snap-save NAME=x~ / ~make snap-restore NAME=x~ / ~make snap-list~
+
+*** Clearing
+- ~make clear-wikidata~ / ~make clear-agda~ / ~make clear-concepts~ / ~make clear-links~ / ~make clear-all~
+
+*** Status
+- ~make status~ -- quick DB inspection via ~pipeline_status~
+
+All targets have Docker variants using ~docker compose exec~ / ~docker compose cp~.
+
+* CI & Deployment
+
+** CI
+
+GitHub Actions (~.github/workflows/test.yml~) runs ~python manage.py test~ inside ~web/~ on each push.
+
+** Deployment
+
+Docker Compose deployment with ~docker-compose.yml~. Also supports systemd service on a bare Linux host.
+
+Update procedure (Docker):
+#+begin_src bash
+docker compose down
+git pull
+docker compose up --build -d
+docker compose exec web python manage.py rebuild_db
+#+end_src
+
+Update procedure (systemd):
+#+begin_src bash
+sudo systemctl stop mathswitch
+git pull && source venv/bin/activate
+cd web && ./manage.py rebuild_db
+sudo systemctl start mathswitch
+#+end_src
+
+Static files are collected to ~/var/www/mathswitch/static~ (configured in ~settings.STATIC_ROOT~) and served by the host web server.
+
+* Bug Fixes Applied
+
+** Fixed: UnionFind class-level mutable attributes (concepts/utils.py)
+
+*Bug:* ~item_to_element~, ~components~, and ~element_links~ were defined as class-level attributes (shared across all instances). This caused data pollution when creating multiple ~UnionFind~ instances, as subsequent instances would inherit and corrupt data from previous ones.
+
+*Fix:* Moved all mutable attributes into ~__init__~ as instance attributes. Also replaced ~map()~ iterators with concrete tuples via a new ~_resolve_link()~ method that validates link pairs and skips invalid ones with logging.
+
+** Fixed: OtherWdRawItem.save_links() type error (slurper/wd_raw_item.py)
+
+*Bug:* ~OtherWdRawItem.save_links()~ called ~self.save_link_to(WdRawItem(self.raw))~, passing a ~WdRawItem~ instance where ~save_link_to()~ expects an ~Item.Source~ enum value. This would cause a type error or incorrect behavior at runtime.
+
+*Fix:* Changed to ~self.save_link_to(Item.Source.WIKIDATA)~ -- the correct enum value.
+
+** Fixed: Item.get_linked_items() uses non-existent .map() (concepts/models.py)
+
+*Bug:* ~Item.get_linked_items()~ called ~.map()~ on Django QuerySets. QuerySet has no ~.map()~ method -- this would raise ~AttributeError~ at runtime. Also used ~+~ to combine results, which doesn't work for QuerySets.
+
+*Fix:* Replaced with proper QuerySet operations using ~Item.objects.filter()~ with subqueries via ~values_list()~ and ~|~ (union) operator.
+
+** Fixed: Module-level HTTP fetch in AgdaUnimathSlurper (slurper/source_agda_unimath.py)
+
+*Bug:* ~AU_SLURPER = AgdaUnimathSlurper()~ at module level instantiated the slurper (which called ~fetch_json()~ in ~__init__~), firing an HTTP request every time the module was imported -- including during ~manage.py~ startup for any command.
+
+*Fix:* Removed module-level instantiation. ~__init__~ no longer fetches data. The management command now creates an instance and explicitly calls ~fetch_json()~. ~save_items()~ also auto-fetches if ~raw_data~ is ~None~.
+
+** Fixed: URL field max_length too short (concepts/models.py)
+
+*Bug:* ~Item.url~ was ~URLField(max_length=200)~ but agda-unimath URLs can be up to 202 characters long.
+
+*Fix:* Increased to ~URLField(max_length=500)~. *Note:* requires running ~python manage.py makemigrations && python manage.py migrate~ to apply.
+
+* Known Remaining Gaps
+
+- *No tests.* Both ~slurper/tests.py~ and ~concepts/tests.py~ contain only commented-out placeholders. The CI pipeline runs an empty test suite.
+- *Wikipedia fetching is opt-in.* Keywords are only populated when ~WIKIPEDIA_CONTACT_EMAIL~ is set and ~make install-scispacy~ has been run. Items imported without this will have ~keywords=None~ and ~article_text=None~.
+- *Concept name collision handling.* When ~compute_concepts~ encounters a name collision (case-insensitive), it falls back to ~Concept.objects.get(name=name)~ (case-sensitive) instead of ~name__iexact~ -- this could miss the existing concept if casing differs.
+- *No incremental import.* Running ~import_wikidata~ or ~import_agda_unimath~ after data already exists will fail on duplicates rather than updating. The intended workflow is clear-then-reimport.
+
+* Forward Plans
+
+** Agda Unimath importer -- potential further improvements
+
+The current ~concept_index.json~ import covers 1,862 tagged concepts. Additional data could be imported from:
+
+1. *Module-level items*: The agda-unimath library has ~1,000+ module files organized by topic area. Each ~.lagda.md~ file has a title (e.g., "Abstract groups") and typically an "Idea" section with a natural-language description. These could be imported as additional items.
+
+2. *SUMMARY.md / module listing*: The ~generate_mdbook_summary.py~ script produces a full module listing with titles. This could be fetched or generated to discover modules not covered by ~{{#concept}}~ tags.
+
+3. *Direct Agda definition extraction*: The ~definition~ field in ~concept_index.json~ points to specific Agda definition anchors. These could be used to generate richer descriptions linking to formal definitions.
+
+** Data source for module-level import
+
+The agda-unimath repository provides:
+- ~scripts/preprocessor_concepts.py~ -- the official concept preprocessor
+- ~scripts/generate_mdbook_summary.py~ -- generates the module index
+- ~scripts/utils/__init__.py~ -- includes ~get_lagda_md_file_title()~ which extracts titles from ~# Heading~ in ~.lagda.md~ files
+- Module naming convention: ~src/<area>/<concept>.lagda.md~ where ~<area>~ is like ~group-theory~ and ~<concept>~ is like ~groups~
+- Each module file starts with ~# Title~ and has structured sections (~## Idea~, ~## Definition~, ~## Properties~)
+
+** Improving concept merging quality
+
+- Fix the ~name__iexact~ lookup in ~create_concepts~ for proper case-insensitive deduplication
+- Consider weighting sources differently when choosing concept names/descriptions
+- Consider using aliases for additional name-matching in ~link_same~
