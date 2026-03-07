@@ -3,3 +3,10 @@ __pycache__
 web/**/*.sqlite3
 **/.env
 /.DS_Store
+
+# Snapshots and fixtures (generated data, not code)
+web/snapshots/
+fixtures/
+
+# Personal project analysis file
+PROJECT_REPORT.org
