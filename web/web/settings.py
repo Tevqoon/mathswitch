@@ -29,9 +29,13 @@ SECRET_KEY = config(
 )
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = config("DEBUG", default=True, cast=bool)
 
-ALLOWED_HOSTS = ["*"]
+ALLOWED_HOSTS = config(
+    "ALLOWED_HOSTS",
+    default="*",
+    cast=lambda v: [s.strip() for s in v.split(",")],
+)
 
 
 # Application definition
@@ -86,7 +90,7 @@ WSGI_APPLICATION = "web.wsgi.application"
 DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.sqlite3",
-        "NAME": BASE_DIR / "db.sqlite3",
+        "NAME": config("DB_PATH", default=str(BASE_DIR / "db.sqlite3")),
     }
 }
 
@@ -125,9 +129,9 @@ USE_TZ = True
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/4.2/howto/static-files/
 
-STATIC_URL = "static/"
+STATIC_URL = "/static/"
 
-STATIC_ROOT = "/var/www/mathswitch/static"
+STATIC_ROOT = config("STATIC_ROOT", default=str(BASE_DIR / "staticfiles"))
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/4.2/ref/settings/#default-auto-field

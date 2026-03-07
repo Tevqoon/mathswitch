@@ -4,125 +4,129 @@ Infrastructure for relaying and exchanging mathematical concepts.
 
 For a demonstration of a page with at least one link, see for example `{baseurl}/concept/Schwartz%20space/`.
 
-## Notes on installation and usage
+## Running with Docker (recommended)
 
-For virtual environment (venv) do the following:
+### First-time setup
+
+```bash
+cp web/.env.example web/.env
+# Edit web/.env: set SECRET_KEY, WIKIPEDIA_CONTACT_EMAIL, ALLOWED_HOSTS
+docker compose build        # ~10–20 min first time (torch + scispaCy model)
+docker compose up -d
+```
+
+The site is then available at `http://localhost`.
+
+The database and static files are stored in named Docker volumes (`db` and
+`static`) and persist across restarts.
+
+### Populate the database
+
+```bash
+make docker-populate-db
+```
+
+Or run individual steps:
+
+```bash
+docker compose exec web python manage.py import_wikidata
+docker compose exec web python manage.py import_agda_unimath
+docker compose exec web python manage.py link_same
+docker compose exec web python manage.py compute_concepts
+```
+
+### Rebuild the database from scratch
+
+```bash
+make docker-rebuild-db
+```
+
+### Run the categorizer
+
+```bash
+docker compose exec web python manage.py categorize --limit 10
+```
+
+### Update the live version
+
+```bash
+git pull
+docker compose build
+docker compose up -d
+```
+
+---
+
+## Running without Docker (local development)
+
+### Setup
+
 ```bash
 python3 -m venv venv
 source venv/bin/activate
+make prepare-web  # installs packages, copies .env, runs migrate, creates superuser
 ```
 
-To install all the necessary Python packages, run:
+To enable Wikipedia article fetching and keyword extraction:
 
 ```bash
-make prepare-web # Which does the necessary steps for env, db, superuser
-# OR
-pip install -r web/requirements.txt
+make install-scispacy
 ```
 
-Prepare an environment:
-```bash
-cp web/.env.example web/.env
-```
+Then set `WIKIPEDIA_CONTACT_EMAIL` in `web/.env`.
 
-Next, to create a database, run:
+### Populate the database
 
-```bash
-python manage.py migrate
-```
-
-In order to use the administrative interface, you need to create an admin user:
-
-```bash
-python manage.py createsuperuser
-```
-
-Finally, to populate the database, run
-
-```bash
-python manage.py import_wikidata
-# OR
-make populate-db
-```
-
-  * In order to fetch wikipedia articles and extract keywords from them:
-    ```bash
-    make install-scispacy
-    ```
-    then configure your email `WIKIPEDIA_CONTACT_EMAIL` in [source_wikidata.py](web/slurper/source_wikidata.py)
-    * This is needed
-  * Then run the database population (make sure your db is cleared)
-
-
-
-If you ever want to repopulate the database, you can clear it using
-
-```bash
-python manage.py clear_wikidata
-```
-
-### To run the categorizer
-The categorizer is setup to work with several models, divided into free and paid.
-All of them are run locally, so expect some performance hits. The models are downloaded when the categorizer is
-ran initially, and by default the free models are used.
-
-The database needs to be filled in before running it, so:
 ```bash
 make populate-db
 ```
-then
+
+### Run the development server
+
+```bash
+make start
+```
+
+### Run the categorizer
+
+The categorizer works with several local models (free) or paid APIs (OpenAI,
+Anthropic). Models are downloaded on first run. The database must be populated
+first.
+
 ```bash
 make categorize
 ```
 
-There are some known existing issues that have some inline fixes, such as `gpt2` getting stuck
-and returning the same prompt, then few times `---\n\n\n---`.
-
 For more details see [categorizer readme](web/categorizer/README.md).
+
+---
 
 ## Notes for developers
 
-In order to contribute, install [Black](https://github.com/psf/black) and [isort](https://pycqa.github.io/isort/) autoformatters and [Flake8](https://flake8.pycqa.org/) linter.
+Install formatters and linter:
+
 ```bash
 make install-dev
 ```
 
-You can run all three with
+Run all three:
+
 ```bash
 make fix-files
-# Or manually
-isort .
-black .
-flake8
 ```
 
-or set up a Git pre-commit hook by creating `.git/hooks/pre-commit` with the following contents:
+Or set up a Git pre-commit hook (`.git/hooks/pre-commit`):
 
 ```bash
 #!/bin/bash
-
 black . && isort . && flake8
 ```
 
-Each time after you change a model, make sure to create the appropriate migrations:
+After changing a model:
+
 ```bash
 python manage.py makemigrations
-```
-
-To update the database with the new model, run:
-```bash
-    python manage.py migrate
-```
-
-## Instructions for Katja to update the live version
-```bash
-sudo systemctl stop mathswitch
-cd mathswitch
-git pull
-source venv/bin/activate
-cd web
-./manage.py rebuild_db
-sudo systemctl start mathswitch
+python manage.py migrate
 ```
 ## WD item JSON example
 

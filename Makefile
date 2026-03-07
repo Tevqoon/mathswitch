@@ -30,3 +30,26 @@ fix-files:
 	python3 -m black .
 	python3 -m isort .
 	python3 -m flake8 .
+
+# Docker targets
+
+docker-build:
+	docker compose build
+
+docker-up:
+	docker compose up -d
+
+docker-down:
+	docker compose down
+
+docker-logs:
+	docker compose logs -f
+
+docker-populate-db:
+	docker compose exec web python manage.py import_wikidata
+	docker compose exec web python manage.py import_agda_unimath
+	docker compose exec web python manage.py link_same
+	docker compose exec web python manage.py compute_concepts
+
+docker-rebuild-db:
+	docker compose exec web python manage.py rebuild_db
