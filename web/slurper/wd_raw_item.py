@@ -182,7 +182,7 @@ class OtherWdRawItem(BaseWdRawItem):
     def save_links(self):
         super().save_links()
         # link back to WD items
-        self.save_link_to(WdRawItem(self.raw))
+        self.save_link_to(Item.Source.WIKIDATA)
 
 
 class nLabRawItem(OtherWdRawItem):

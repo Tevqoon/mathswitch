@@ -85,7 +85,7 @@ class Item(models.Model):
 
     source = models.CharField(max_length=4, choices=Source.choices)
     identifier = models.CharField(max_length=200)
-    url = models.URLField(max_length=200)
+    url = models.URLField(max_length=500)
     name = models.CharField(max_length=200, null=True)
     description = models.TextField(null=True)
     keywords = models.TextField(null=True, blank=True)
@@ -107,13 +107,17 @@ class Item(models.Model):
         return {"name": self.name, "source": self.get_source_display(), "url": self.url}
 
     def get_linked_items(self):
-        linked_destinations = Link.objects.filter(source=self.id).map(
-            lambda link: link.destination
+        linked_destinations = Item.objects.filter(
+            id__in=Link.objects.filter(source=self).values_list(
+                "destination_id", flat=True
+            )
         )
-        linked_sources = Link.objects.filter(destination=self.id).map(
-            lambda link: link.source
+        linked_sources = Item.objects.filter(
+            id__in=Link.objects.filter(destination=self).values_list(
+                "source_id", flat=True
+            )
         )
-        return set(linked_sources + linked_destinations)
+        return set(linked_destinations | linked_sources)
 
     def get_linked_item_urls(self):
         return [i.get_url() for i in self.get_linked_items()]

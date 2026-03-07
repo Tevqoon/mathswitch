@@ -1,32 +1,52 @@
-from typing import Any, Dict, List, Tuple
+import logging
+from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 
 class UnionFind:
-    item_to_element: Dict[Any, int] = {}
-    components: Dict[int, List[int]] = {}
-    element_links: List[Tuple[int, int]] = []
-
     def __init__(self, items, links):
         """Initialize union-find with a list of items
         and a list of links given as pairs of items."""
+        self.item_to_element: Dict[Any, int] = {}
+        self.components: Dict[int, List[int]] = {}
+        self.element_links: List[Tuple[int, int]] = []
+
         self.size = len(items)
         self.item_list = list(items)
-        self.parent = [i for i in range(self.size)]
+        self.parent = list(range(self.size))
         self.rank = [0] * self.size
         for i, item in enumerate(self.item_list):
             self.item_to_element[item] = i
         for link in links:
-            elt_link = map(self.item_to_element.get, link)
-            self.element_links.append(elt_link)
+            resolved = self._resolve_link(link)
+            if resolved is not None:
+                self.element_links.append(resolved)
         self._compute_components()
 
+    def _resolve_link(self, link) -> Optional[Tuple[int, int]]:
+        """Convert a link (pair of items) to a pair of element indices.
+        Returns None if either item is not found."""
+        items = tuple(link)
+        if len(items) != 2:
+            logger.warning(
+                "Link with %d items (expected 2), skipping: %s", len(items), items
+            )
+            return None
+        a = self.item_to_element.get(items[0])
+        b = self.item_to_element.get(items[1])
+        if a is None or b is None:
+            logger.debug("Link references unknown item(s), skipping: %s", items)
+            return None
+        return (a, b)
+
     # find the root element for given element
-    def _find_representative(self, x):
+    def _find_representative(self, x: int) -> int:
         if self.parent[x] != x:
             self.parent[x] = self._find_representative(self.parent[x])
         return self.parent[x]
 
-    def _union(self, root_x, root_y):
+    def _union(self, root_x: int, root_y: int):
         if root_x != root_y:
             if self.rank[root_x] < self.rank[root_y]:
                 self.parent[root_x] = root_y
@@ -37,9 +57,10 @@ class UnionFind:
                 self.rank[root_x] += 1
 
     def _connect_elements(self):
-        for link in self.element_links:
-            roots = map(self._find_representative, link)
-            self._union(*roots)
+        for a, b in self.element_links:
+            root_a = self._find_representative(a)
+            root_b = self._find_representative(b)
+            self._union(root_a, root_b)
 
     def _compute_components(self):
         self._connect_elements()
